@@ -10,7 +10,7 @@ Stieger here: https://doi.org/10.1038/s41597-021-00883-1
     - PSD via integration in the band we want
     - control is  alpha(C4) - alpha(C3)
     - baseline (first 10 s): collects mean(H), prints BASELINE
-    - after baseline: rolling z-score over last 30 s, prints LEFT/RIGHT command
+    - after baseline: rolling z-score over last 30 s, outputs cmd in {-1,0,+1}
 
 Electrode order (AspireCreate System)
 fz, fc3, fc1, fcz, fc2, fc4, C3, C1, Cz, C2, C4, Cp3, Cp1, CpZ, Cp2, Cp4
@@ -32,19 +32,18 @@ ELECTRODES = [
     "CP3", "CP1", "CPZ", "CP2", "CP4"
 ]
 
-UPDATE_SEC = 0.040          # 40 ms
-WIN_SEC = 1             # 1 s
-AR_ORDER = 16               # Arbitrary tbh, I chose 16th order but i think the original wolpaw paper was 12th? Either way it works. 
-ALPHA_LO, ALPHA_HI = 10.5, 13.5  # 3 Hz bin centered at 12 Hz based of Stieger paper
-BASELINE_SEC = 10.0 # Normalising the outputs
-ZSCORE_SEC = 30.0 # The rolling window for recalc z score
-Z_CLIP = 3.0 # anything above 3 we just clip it, we're not doing magnitude = speed but we can do if u want
+UPDATE_SEC = 0.040              # 40 ms update
+WIN_SEC = 1.0                   # 1 s window
+AR_ORDER = 16                   # AR model order
+ALPHA_LO, ALPHA_HI = 10.5, 13.5 # alpha bin around 12 Hz
+BASELINE_SEC = 10.0             # baseline duration
+ZSCORE_SEC = 30.0               # rolling z-score window duration
+Z_CLIP = 1.0                    # clip z to [-Z_CLIP, +Z_CLIP]
+Z_DEADBAND = 0.5                # deadband threshold for cmd=0 (tune 0.3–1.0)
 
-
-# Left: around C3: FC3, Cp3, C1, Cz
-# Right: around C4: FC4, Cp4, C2, Cz
-SURROUND_C3 = ["fc3", "Cp3", "C1", "Cz"]
-SURROUND_C4 = ["fc4", "Cp4", "C2", "Cz"]
+# Laplacian surrounds
+SURROUND_C3 = ["FC3", "CP3", "C1", "CZ"]
+SURROUND_C4 = ["FC4", "CP4", "C2", "CZ"]
 
 
 def yule_walker_ar(x: np.ndarray, order: int):
@@ -64,7 +63,7 @@ def yule_walker_ar(x: np.ndarray, order: int):
 
 def ar_bandpower(x: np.ndarray, order: int, f_lo: float, f_hi: float, fs: float):
     """
-    AR PSD via freq response of sqrt(sigma2)/A(z); integrate over [f_lo, f_hi]. In our case, its centered around 12Hz 3 Hz bin width so 10.5-13.5Hz.
+    AR PSD via freq response of sqrt(sigma2)/A(z); integrate over [f_lo, f_hi].
     """
     A, sigma2 = yule_walker_ar(x, order)
     freqs, h = sig.freqz(np.sqrt(sigma2), A, worN=1024, fs=fs)
@@ -80,7 +79,6 @@ def resolve_inlet():
     if not streams:
         raise SystemExit("No LSL streams found.")
 
-    # Prefer EEG streams if available
     eeg = [s for s in streams if (s.type() or "").lower() == "eeg"]
     chosen = eeg[0] if eeg else streams[0]
 
@@ -90,7 +88,6 @@ def resolve_inlet():
     if fs <= 0:
         raise SystemExit("Stream nominal_srate() is 0/unknown. This script requires a fixed sampling rate.")
 
-    # Try to map channel labels from stream metadata (if present); else assume incoming order matches ELECTRODES
     labels = []
     try:
         ch = info.desc().child("channels").child("channel")
@@ -106,7 +103,7 @@ def resolve_inlet():
 
 def build_index_map(stream_labels):
     """
-    Returns a dict electrode_name -> index in incoming sample vector.
+    Returns electrode_name -> index in incoming sample vector.
     If stream_labels are present, map by label (case-insensitive).
     Else assume incoming order is exactly ELECTRODES.
     """
@@ -128,7 +125,6 @@ def build_index_map(stream_labels):
             )
         return idx
 
-    # Fallback: assume strict order
     return {e: i for i, e in enumerate(ELECTRODES)}
 
 
@@ -174,18 +170,16 @@ def main():
     baseline_buf = []
 
     last_print = 0.0
-
     sample_count = 0
+
     while True:
         s, _ = inlet.pull_sample(timeout=1.0)
         if not s:
             continue
 
-        # Keep only channels we need; still store full vector for indexing
         buf.append(np.asarray(s, dtype=float))
         sample_count += 1
 
-        # Update every step_n samples once we have a full window
         if len(buf) < win_n or (sample_count % step_n) != 0:
             continue
 
@@ -196,35 +190,43 @@ def main():
         p3 = ar_bandpower(c3f, ar_order, ALPHA_LO, ALPHA_HI, fs)
         p4 = ar_bandpower(c4f, ar_order, ALPHA_LO, ALPHA_HI, fs)
 
-        diff = float(p4 - p3)  # horizontal control
+        # Left-right asymmetry feature (positive means "more alpha on C4 than C3")
+        diff = float(p4 - p3)
 
-        # Baseline
+        # Baseline: estimate typical diff at rest
         if len(baseline_buf) < baseline_updates:
             baseline_buf.append(diff)
             if time.time() - last_print > 0.5:
-                mu = float(np.mean(baseline_buf))
-                print(f"BASELINE  n={len(baseline_buf)}/{baseline_updates}  diff={diff:+.3e}  mean={mu:+.3e}")
+                mu0 = float(np.mean(baseline_buf))
+                print(f"BASELINE  n={len(baseline_buf)}/{baseline_updates}  diff={diff:+.3e}  mean={mu0:+.3e}")
                 last_print = time.time()
             continue
 
         baseline_mean = float(np.mean(baseline_buf))
-        diff_b = diff - baseline_mean
+        diff_b = diff - baseline_mean  # baseline-corrected asymmetry
 
-        # Rolling z-score
+        # Rolling z-score: normalize diff_b relative to recent history
         diff_hist.append(diff_b)
         arr = np.asarray(diff_hist, dtype=float)
         mu = float(arr.mean())
         sd = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+
         eps = 1e-12 + 1e-3 * abs(mu)
         z = 0.0 if sd < eps else (diff_b - mu) / sd
+
         if Z_CLIP > 0:
             z = float(np.clip(z, -Z_CLIP, Z_CLIP))
 
-        cmd = "RIGHT" if z > 0 else "LEFT"
+        # Quantize to: +1 (up), -1 (down), 0 (stop)
+        if z > Z_DEADBAND:
+            cmd = 1
+        elif z < -Z_DEADBAND:
+            cmd = -1
+        else:
+            cmd = 0
 
-        # Print every update (40 ms)
         print(
-            f"{cmd:5s}  "
+            f"cmd={cmd:+d}  "
             f"z={z:+.3f}  "
             f"diff={diff:+.3e}  "
             f"diff_b={diff_b:+.3e}  "
